@@ -39,15 +39,29 @@ CREATE TABLE code_context_events (
 CREATE OR REPLACE FUNCTION auto_supersede_symbol()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.symbol_name IS NOT NULL AND NEW.superseded = FALSE THEN
-        UPDATE code_context_events
-        SET superseded = TRUE
-        WHERE repository_id = NEW.repository_id
-          AND file_path = NEW.file_path
-          AND symbol_name = NEW.symbol_name
-          AND recorded_at < NEW.recorded_at
-          AND event_id <> NEW.event_id
-          AND superseded = FALSE;
+    IF NEW.symbol_name IS NOT NULL THEN
+        -- Case A: Forward stream - mark older entries as superseded
+        IF NEW.superseded = FALSE THEN
+            UPDATE code_context_events
+            SET superseded = TRUE
+            WHERE repository_id = NEW.repository_id
+              AND file_path = NEW.file_path
+              AND symbol_name = NEW.symbol_name
+              AND recorded_at < NEW.recorded_at
+              AND event_id <> NEW.event_id
+              AND superseded = FALSE;
+        END IF;
+
+        -- Case B: Reverse backfill stream - if a newer implementation already exists, mark NEW as superseded
+        IF EXISTS (
+            SELECT 1 FROM code_context_events
+            WHERE repository_id = NEW.repository_id
+              AND file_path = NEW.file_path
+              AND symbol_name = NEW.symbol_name
+              AND recorded_at > NEW.recorded_at
+        ) THEN
+            NEW.superseded := TRUE;
+        END IF;
     END IF;
     RETURN NEW;
 END;

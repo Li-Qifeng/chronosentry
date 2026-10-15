@@ -7,7 +7,6 @@ CREATE EXTENSION IF NOT EXISTS vector;
 DROP TRIGGER IF EXISTS trg_auto_supersede ON code_context_events;
 DROP FUNCTION IF EXISTS auto_supersede_symbol CASCADE;
 DROP FUNCTION IF EXISTS match_code_context_two_stage CASCADE;
-DROP FUNCTION IF EXISTS match_code_context_temporal CASCADE;
 DROP TABLE IF EXISTS code_context_events CASCADE;
 DROP TABLE IF EXISTS agent_sessions CASCADE;
 
@@ -35,7 +34,7 @@ CREATE TABLE code_context_events (
     embedding HALFVEC(1536) NOT NULL
 );
 
--- Automated AST Supersession Trigger
+-- Automated AST Supersession Trigger (Strict Chronological Invariant)
 -- When a new implementation of a symbol in the same file is committed, older entries are marked superseded
 CREATE OR REPLACE FUNCTION auto_supersede_symbol()
 RETURNS TRIGGER AS $$
@@ -46,6 +45,7 @@ BEGIN
         WHERE repository_id = NEW.repository_id
           AND file_path = NEW.file_path
           AND symbol_name = NEW.symbol_name
+          AND recorded_at < NEW.recorded_at
           AND event_id <> NEW.event_id
           AND superseded = FALSE;
     END IF;
@@ -57,11 +57,14 @@ CREATE TRIGGER trg_auto_supersede
 BEFORE INSERT ON code_context_events
 FOR EACH ROW EXECUTE FUNCTION auto_supersede_symbol();
 
--- HNSW Cosine Index over halfvec(1536) for 50% RAM efficiency
-CREATE INDEX idx_code_context_halfvec_hnsw 
+-- Partial HNSW Cosine Index over active halfvec(1536)
+-- Crucial: By indexing only active (superseded = FALSE) vectors, the HNSW graph never
+-- wastes ef_search budget traversing dead/superseded nodes.
+CREATE INDEX idx_code_context_active_hnsw 
 ON code_context_events 
 USING hnsw (embedding halfvec_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+WITH (m = 16, ef_construction = 64)
+WHERE (superseded = FALSE);
 
 -- Composite btree index for repo + temporal queries
 CREATE INDEX idx_code_context_repo_time 
@@ -70,7 +73,7 @@ ON code_context_events (repository_id, recorded_at DESC);
 CREATE INDEX idx_code_context_file_symbol 
 ON code_context_events (repository_id, file_path, symbol_name);
 
--- Two-Stage Retrieval CTE: Rescues HNSW Index Traversal
+-- Two-Stage Retrieval CTE:
 -- Stage 1: Fast HNSW Approximate Nearest Neighbor Graph Traversal (O(log N))
 -- Stage 2: Adaptive In-Memory Spatio-Temporal Re-ranking with Evergreen Mutability Classes
 CREATE OR REPLACE FUNCTION match_code_context_two_stage(
@@ -93,7 +96,7 @@ RETURNS TABLE (
 )
 LANGUAGE sql STABLE AS $$
     WITH candidate_vectors AS (
-        -- Stage 1: Native HNSW Vector Graph Traversal
+        -- Stage 1: Native Partial HNSW Vector Graph Traversal
         SELECT 
             c.event_id,
             c.recorded_at,
@@ -103,8 +106,8 @@ LANGUAGE sql STABLE AS $$
             c.code_diff,
             (1 - (c.embedding <=> query_vec))::FLOAT AS cosine_sim
         FROM code_context_events c
-        WHERE c.repository_id = target_repo
-          AND c.superseded = FALSE
+        WHERE c.superseded = FALSE
+          AND c.repository_id = target_repo
         ORDER BY c.embedding <=> query_vec
         LIMIT candidate_k
     )

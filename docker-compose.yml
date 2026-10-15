@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: chronosentry-db
+    restart: always
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: tigerpass
+    ports:
+      - "54329:5432"
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/init.sql
